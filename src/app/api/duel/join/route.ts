@@ -14,10 +14,30 @@ import {
 import type { Player, Room } from "@/lib/duel-state";
 
 export async function POST(req: NextRequest) {
-  const { nickname } = await req.json();
+  let nickname: string;
+  try {
+    const body = await req.json();
+    nickname = body.nickname;
+  } catch {
+    return NextResponse.json({ error: "Invalid request body" }, { status: 400 });
+  }
+
   if (!nickname || typeof nickname !== "string") {
     return NextResponse.json({ error: "Nickname required" }, { status: 400 });
   }
+
+  try {
+    return await handleJoin(nickname);
+  } catch (err) {
+    console.error("Join error:", err);
+    return NextResponse.json(
+      { error: `Server error: ${err instanceof Error ? err.message : String(err)}` },
+      { status: 500 }
+    );
+  }
+}
+
+async function handleJoin(nickname: string) {
 
   const playerId = generateId();
   const player: Player = {
@@ -92,12 +112,10 @@ export async function POST(req: NextRequest) {
     });
   }
 
-  if (!matched) {
-    // No match found, join queue
-    await joinQueue(playerId);
-    return NextResponse.json({
-      playerId,
-      status: "waiting",
-    });
-  }
+  // No match found, join queue
+  await joinQueue(playerId);
+  return NextResponse.json({
+    playerId,
+    status: "waiting",
+  });
 }

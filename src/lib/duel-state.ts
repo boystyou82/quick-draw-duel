@@ -1,4 +1,21 @@
-import { kv } from "@vercel/kv";
+import { createClient } from "redis";
+
+// Singleton Redis client
+let redisClient: ReturnType<typeof createClient> | null = null;
+
+async function getRedis() {
+  if (!redisClient) {
+    redisClient = createClient({
+      url: process.env.REDIS_URL,
+    });
+    redisClient.on("error", (err) => console.error("Redis error:", err));
+    await redisClient.connect();
+  }
+  if (!redisClient.isOpen) {
+    await redisClient.connect();
+  }
+  return redisClient;
+}
 
 export interface Player {
   id: string;
@@ -8,16 +25,14 @@ export interface Player {
 
 export interface Room {
   id: string;
-  players: string[]; // playerIds
+  players: string[];
   state: "waiting" | "countdown" | "draw" | "finished";
   triggerType: string;
-  // Timestamps for phase transitions (serverless-friendly)
   countdownAt: number;
   triggerAt: number;
   drawAt: number;
   timeoutAt: number;
-  // Results
-  shots: Record<string, number>; // playerId -> timestamp
+  shots: Record<string, number>;
   tooEarly: string[];
   winner: string | null;
 }
@@ -45,66 +60,71 @@ export function generateId(): string {
   return Math.random().toString(36).substring(2, 10);
 }
 
-// KV helpers
-const KEYS = {
-  player: (id: string) => `duel:player:${id}`,
-  room: (id: string) => `duel:room:${id}`,
-  queue: "duel:queue",
-  ranking: (nickname: string) => `duel:rank:${nickname}`,
-  rankingIndex: "duel:rankings",
-};
-
-const TTL = 300; // 5 min expiry for rooms/players
+const TTL = 300;
 
 export async function getPlayer(id: string): Promise<Player | null> {
-  return kv.get<Player>(KEYS.player(id));
+  const redis = await getRedis();
+  const data = await redis.get(`duel:player:${id}`);
+  return data ? JSON.parse(data) : null;
 }
 
 export async function setPlayer(player: Player) {
-  await kv.set(KEYS.player(player.id), player, { ex: TTL });
+  const redis = await getRedis();
+  await redis.set(`duel:player:${player.id}`, JSON.stringify(player), { EX: TTL });
 }
 
 export async function getRoom(id: string): Promise<Room | null> {
-  return kv.get<Room>(KEYS.room(id));
+  const redis = await getRedis();
+  const data = await redis.get(`duel:room:${id}`);
+  return data ? JSON.parse(data) : null;
 }
 
 export async function setRoom(room: Room) {
-  await kv.set(KEYS.room(room.id), room, { ex: TTL });
+  const redis = await getRedis();
+  await redis.set(`duel:room:${room.id}`, JSON.stringify(room), { EX: TTL });
 }
 
 export async function joinQueue(playerId: string) {
-  await kv.rpush(KEYS.queue, playerId);
+  const redis = await getRedis();
+  await redis.rPush("duel:queue", playerId);
+  await redis.expire("duel:queue", TTL);
 }
 
 export async function popQueue(): Promise<string | null> {
-  return kv.lpop(KEYS.queue);
+  const redis = await getRedis();
+  return redis.lPop("duel:queue");
 }
 
 export async function getRanking(nickname: string): Promise<RankEntry | null> {
-  return kv.get<RankEntry>(KEYS.ranking(nickname));
+  const redis = await getRedis();
+  const data = await redis.get(`duel:rank:${nickname}`);
+  return data ? JSON.parse(data) : null;
 }
 
 export async function setRanking(entry: RankEntry) {
-  await kv.set(KEYS.ranking(entry.nickname), entry);
-  // Store in sorted set for leaderboard
-  await kv.zadd(KEYS.rankingIndex, { score: entry.wins, member: entry.nickname });
+  const redis = await getRedis();
+  await redis.set(`duel:rank:${entry.nickname}`, JSON.stringify(entry));
+  await redis.zAdd("duel:rankings", { score: entry.wins, value: entry.nickname });
 }
 
 export async function getTopRankings(limit: number = 20): Promise<RankEntry[]> {
-  const nicknames = await kv.zrange<string[]>(KEYS.rankingIndex, 0, limit - 1, { rev: true });
+  const redis = await getRedis();
+  const nicknames = await redis.zRange("duel:rankings", 0, limit - 1, { REV: true });
   if (!nicknames || nicknames.length === 0) return [];
 
   const results: RankEntry[] = [];
   for (const nick of nicknames) {
-    const entry = await kv.get<RankEntry>(KEYS.ranking(nick));
-    if (entry && entry.wins + entry.losses > 0) {
-      results.push(entry);
+    const data = await redis.get(`duel:rank:${nick}`);
+    if (data) {
+      const entry: RankEntry = JSON.parse(data);
+      if (entry.wins + entry.losses > 0) {
+        results.push(entry);
+      }
     }
   }
   return results.sort((a, b) => b.wins - a.wins || a.losses - b.losses);
 }
 
-// Compute current phase from room timestamps
 export function computePhase(room: Room): string {
   if (room.state === "finished") return "result";
   if (room.state === "waiting") return "waiting";
