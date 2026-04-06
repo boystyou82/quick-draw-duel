@@ -24,9 +24,11 @@ type ScenePhase =
 
 interface DuelResult {
   winner: string | null;
-  reason: string;
   shots: Record<string, number>;
   tooEarly: string[];
+  drawAt: number;
+  myId: string;
+  players: string[];
 }
 
 interface RankEntry {
@@ -63,8 +65,8 @@ export default function DuelGame() {
   const [myReactionTime, setMyReactionTime] = useState<number | null>(null);
   const [rankings, setRankings] = useState<RankEntry[]>([]);
   const [hasShot, setHasShot] = useState(false);
-  const eventSourceRef = useRef<EventSource | null>(null);
-  const drawTimeRef = useRef<number>(0);
+  const [drawTime, setDrawTime] = useState<number>(0);
+  const pollingRef = useRef<NodeJS.Timeout | null>(null);
 
   // Fetch rankings
   const fetchRankings = useCallback(async () => {
@@ -79,53 +81,52 @@ export default function DuelGame() {
     fetchRankings();
   }, [fetchRankings]);
 
-  // SSE connection
-  const connectSSE = useCallback(
+  // Polling for game state
+  const startPolling = useCallback(
     (pid: string) => {
-      if (eventSourceRef.current) {
-        eventSourceRef.current.close();
-      }
+      if (pollingRef.current) clearInterval(pollingRef.current);
 
-      const es = new EventSource(`/api/duel/stream?playerId=${pid}`);
-      eventSourceRef.current = es;
+      pollingRef.current = setInterval(async () => {
+        try {
+          const res = await fetch(`/api/duel/status?playerId=${pid}`);
+          if (!res.ok) return;
+          const data = await res.json();
 
-      es.addEventListener("matched", (e) => {
-        const data = JSON.parse(e.data);
-        setOpponent(data.opponent);
-        setPhase("matched");
-      });
+          if (data.opponent) setOpponent(data.opponent);
+          if (data.triggerType) setTriggerType(data.triggerType);
 
-      es.addEventListener("countdown", () => {
-        setPhase("countdown");
-      });
+          if (data.phase === "result" && data.result) {
+            setResult(data.result);
+            setPhase("result");
+            fetchRankings();
+            if (pollingRef.current) clearInterval(pollingRef.current);
+            return;
+          }
 
-      es.addEventListener("trigger_hint", (e) => {
-        const data = JSON.parse(e.data);
-        setTriggerType(data.type || "bell");
-        setPhase("trigger_hint");
-      });
-
-      es.addEventListener("draw", (e) => {
-        const data = JSON.parse(e.data);
-        drawTimeRef.current = data.timestamp;
-        setPhase("draw");
-      });
-
-      es.addEventListener("result", (e) => {
-        const data = JSON.parse(e.data) as DuelResult;
-        setResult(data);
-        setPhase("result");
-        fetchRankings();
-      });
-
-      es.onerror = () => {};
+          // Map server phase to client phase
+          const serverPhase = data.phase as string;
+          if (serverPhase === "matched" && phase !== "matched") {
+            setPhase("matched");
+          } else if (serverPhase === "countdown" && phase !== "countdown") {
+            setPhase("countdown");
+          } else if (serverPhase === "trigger_hint" && phase !== "trigger_hint") {
+            setPhase("trigger_hint");
+          } else if (serverPhase === "draw") {
+            if (data.drawTime) setDrawTime(data.drawTime);
+            if (phase !== "draw" && phase !== "too_early") {
+              setPhase("draw");
+            }
+          }
+        } catch {}
+      }, 400);
     },
-    [fetchRankings]
+    [phase, fetchRankings]
   );
 
+  // Cleanup polling
   useEffect(() => {
     return () => {
-      eventSourceRef.current?.close();
+      if (pollingRef.current) clearInterval(pollingRef.current);
     };
   }, []);
 
@@ -153,11 +154,11 @@ export default function DuelGame() {
         setPhase("waiting");
       }
 
-      connectSSE(data.playerId);
+      startPolling(data.playerId);
     } catch (err) {
       console.error("Failed to join duel:", err);
     }
-  }, [nickname, connectSSE]);
+  }, [nickname, startPolling]);
 
   // Shoot
   const shoot = useCallback(async () => {
@@ -166,22 +167,22 @@ export default function DuelGame() {
       return;
 
     setHasShot(true);
+    const now = Date.now();
 
     if (phase === "countdown" || phase === "trigger_hint") {
       setPhase("too_early");
     }
 
-    const now = Date.now();
-    if (phase === "draw" && drawTimeRef.current) {
-      setMyReactionTime(now - drawTimeRef.current);
+    if (phase === "draw" && drawTime) {
+      setMyReactionTime(now - drawTime);
     }
 
     await fetch("/api/duel/shoot", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ playerId }),
+      body: JSON.stringify({ playerId, shootTime: now }),
     });
-  }, [playerId, phase, hasShot]);
+  }, [playerId, phase, hasShot, drawTime]);
 
   // Keyboard: Space to shoot (not during input)
   useEffect(() => {
@@ -197,7 +198,7 @@ export default function DuelGame() {
   }, [shoot]);
 
   const playAgain = () => {
-    eventSourceRef.current?.close();
+    if (pollingRef.current) clearInterval(pollingRef.current);
     setPhase("nickname");
     setPlayerId(null);
     setHasShot(false);
@@ -205,8 +206,23 @@ export default function DuelGame() {
     setMyReactionTime(null);
   };
 
-  const iWon = result?.winner === nickname;
-  const isDraw = result?.reason === "timeout" && !result.winner;
+  // Resolve result display
+  const iWon = result?.winner
+    ? result.myId === result.winner
+    : false;
+  const isDraw = !result?.winner && phase === "result";
+
+  // Get nicknames for shots display
+  const [playerNicknames, setPlayerNicknames] = useState<Record<string, string>>({});
+  useEffect(() => {
+    if (!result) return;
+    // Build nickname map from what we know
+    const map: Record<string, string> = {};
+    if (playerId) map[playerId] = nickname;
+    const opId = result.players.find((id) => id !== playerId);
+    if (opId) map[opId] = opponent;
+    setPlayerNicknames(map);
+  }, [result, playerId, nickname, opponent]);
 
   const showScene =
     phase === "matched" ||
@@ -275,12 +291,12 @@ export default function DuelGame() {
             ))}
           </div>
           <p className="text-zinc-600 text-xs mt-4">
-            Open another browser tab to join as opponent
+            Share this link — open another tab to test locally
           </p>
         </div>
       )}
 
-      {/* === GAME SCENE (matched → draw → too_early) === */}
+      {/* === GAME SCENE === */}
       {showScene && (
         <div
           onClick={
@@ -303,7 +319,6 @@ export default function DuelGame() {
             triggerType={triggerType}
           />
 
-          {/* Instruction bar below scene */}
           {(phase === "countdown" || phase === "trigger_hint") && (
             <div className="mt-3 text-center">
               <p className="text-amber-400/60 text-sm animate-pulse">
@@ -321,12 +336,16 @@ export default function DuelGame() {
           {phase === "draw" && hasShot && (
             <div className="mt-3 text-center">
               <p className="text-zinc-400 text-sm">
-                Shot fired! {myReactionTime && <span className="text-green-400 font-mono">{myReactionTime}ms</span>} — waiting for opponent...
+                Shot fired!{" "}
+                {myReactionTime && (
+                  <span className="text-green-400 font-mono">
+                    {myReactionTime}ms
+                  </span>
+                )}{" "}
+                — waiting for opponent...
               </p>
             </div>
           )}
-
-          {/* Too early: show retry button */}
           {phase === "too_early" && (
             <div className="mt-4 text-center">
               <p className="text-red-400 mb-3">You drew before the signal!</p>
@@ -366,36 +385,39 @@ export default function DuelGame() {
               <p className="text-3xl text-red-400 font-bold">
                 You lost, partner.
               </p>
-              {result.tooEarly.includes(nickname) && (
+              {result.tooEarly.includes(result.myId) && (
                 <p className="text-red-300 text-sm mt-1">Drew too early!</p>
               )}
             </div>
           )}
 
-          {/* Shot comparison */}
           {Object.keys(result.shots).length > 0 && (
             <div className="flex gap-4 justify-center">
-              {Object.entries(result.shots).map(([name, ms]) => (
-                <div
-                  key={name}
-                  className={`px-5 py-3 rounded-xl ${
-                    name === result.winner
-                      ? "bg-amber-900/50 border border-amber-700"
-                      : "bg-zinc-700/50 border border-zinc-600"
-                  }`}
-                >
-                  <p className="text-xs text-zinc-400">{name}</p>
-                  <p
-                    className={`font-mono font-bold text-lg ${
-                      name === result.winner
-                        ? "text-amber-400"
-                        : "text-zinc-300"
+              {Object.entries(result.shots).map(([pid, ts]) => {
+                const name = playerNicknames[pid] || pid;
+                const ms = Math.round(ts - result.drawAt);
+                return (
+                  <div
+                    key={pid}
+                    className={`px-5 py-3 rounded-xl ${
+                      pid === result.winner
+                        ? "bg-amber-900/50 border border-amber-700"
+                        : "bg-zinc-700/50 border border-zinc-600"
                     }`}
                   >
-                    {ms}ms
-                  </p>
-                </div>
-              ))}
+                    <p className="text-xs text-zinc-400">{name}</p>
+                    <p
+                      className={`font-mono font-bold text-lg ${
+                        pid === result.winner
+                          ? "text-amber-400"
+                          : "text-zinc-300"
+                      }`}
+                    >
+                      {ms}ms
+                    </p>
+                  </div>
+                );
+              })}
             </div>
           )}
 
@@ -473,7 +495,6 @@ export default function DuelGame() {
           </kbd>{" "}
           to shoot
         </p>
-        <p>Open two browser tabs to duel yourself</p>
       </div>
     </div>
   );
